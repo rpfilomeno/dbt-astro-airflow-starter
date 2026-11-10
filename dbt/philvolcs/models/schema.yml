@@ -1,0 +1,38 @@
+version: 2
+
+models:
+  - name: flash_report_input
+    description: Latest PHIVOLCS event as cleaned by dbt - input to the Gemini flash-report task (Postgres target).
+    columns:
+      - name: event_time
+        description: UTC instant of the latest event.
+        tests:
+          - not_null
+      - name: latitude
+        tests:
+          - not_null
+      - name: longitude
+        tests:
+          - not_null
+
+  - name: flash_reports
+    description: Final flash reports in BigQuery (n8n-rogverse.philvolcs.flash_reports) - report message plus lat/lon per event, one row per event.
+    columns:
+      - name: event_time
+        description: UTC instant of the earthquake.
+        tests:
+          - not_null
+      - name: flash_report_message
+        description: LLM-generated flash report text.
+        tests:
+          - not_null
+      - name: latitude
+        tests:
+          - not_null
+      - name: longitude
+        tests:
+          - not_null
+      - name: urgency
+        tests:
+          - accepted_values:
+              values: ['low', 'moderate', 'high']

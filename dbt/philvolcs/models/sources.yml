@@ -1,0 +1,15 @@
+sources:
+  - name: pg_raw
+    description: Raw PHIVOLCS bulletin rows landed by the philvolcs DAG extract task (Postgres target).
+    schema: public
+    tables:
+      - name: raw_phivolcs_earthquakes
+        description: Current-month earthquake table scraped from earthquake.phivolcs.dost.gov.ph, text columns exactly as published.
+
+  - name: bq_raw
+    database: n8n-rogverse
+    description: LLM raw output written by the philvolcs DAG generate_flash_report task (BigQuery target).
+    schema: philvolcs
+    tables:
+      - name: raw_llm_flash_reports
+        description: One row per generated flash report - structured Gemini output plus authoritative PHIVOLCS event fields.

@@ -1,0 +1,27 @@
+name: 'philvolcs'
+
+config-version: 2
+version: '0.1'
+
+profile: 'philvolcs'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+target-path: "target"
+clean-targets:
+    - "target"
+    - "dbt_modules"
+    - "logs"
+
+require-dbt-version: [">=1.0.0", "<2.0.0"]
+
+# Two targets, selected per run by the DAG: postgres for staging models
+# (raw data lives in Postgres), bigquery for flash_reports (final table in
+# n8n-rogverse). Never run a full `dbt run` on one target: flash_reports must
+# only run on bigquery, the staging models only on postgres.
+models:
+  philvolcs:
+    +materialized: table
+    staging:
+      materialized: view

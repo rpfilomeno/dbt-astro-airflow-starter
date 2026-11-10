@@ -3,3 +3,4 @@
 astronomer-cosmos
 apache-airflow-providers-postgres
 apache-airflow-providers-google
+beautifulsoup4

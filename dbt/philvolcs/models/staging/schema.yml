@@ -1,0 +1,25 @@
+version: 2
+
+models:
+  - name: stg_earthquakes
+    description: Cleaned PHIVOLCS bulletin events (current month), one row per event.
+    columns:
+      - name: event_time
+        description: Event time as a UTC instant (source times are Philippine Standard Time).
+        tests:
+          - not_null
+      - name: latitude
+        tests:
+          - not_null
+      - name: longitude
+        tests:
+          - not_null
+      - name: depth_km
+        tests:
+          - not_null
+      - name: magnitude
+        tests:
+          - not_null
+      - name: location
+        tests:
+          - not_null

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Astro (Astronomer) Airflow project wrapping a dbt project (`dbt/jaffle_shop`, the jaffle_shop example). Still mostly scaffold: one example DAG, no dbt-to-Airflow wiring yet. Airflow runs in Docker via the Astro CLI; the README is a one-line stub — trust config and code instead.
+Astro (Astronomer) Airflow project wrapping a dbt project (`dbt/jaffle_shop`, the jaffle_shop example) plus a PHIVOLCS earthquake pipeline. Airflow runs in Docker via the Astro CLI; the README is a one-line stub — trust config and code instead.
 
 ## Commands
 
@@ -18,10 +18,15 @@ Every DAG must import cleanly, have non-empty `tags=[...]`, and set `default_arg
 
 ## Layout
 
-- `dags/` — Airflow DAGs. Airflow 3 style: `from airflow.sdk import dag, task, Asset` (Astro Runtime `3.3-12`). Two DAGs: `exampledag.py` (Astro example) and `import-seeds.py` + `jaffle_shop.py` (drop/seed jaffle_shop, then dbt-build it — asset-scheduled off `SEED://JAFFLE_SHOP`. Together they are the working reference for this stack; verified end-to-end 2026-11-10).
+- `dags/` — Airflow DAGs. Airflow 3 style: `from airflow.sdk import dag, task, Asset` (Astro Runtime `3.3-12`). `exampledag.py` (Astro example), `import-seeds.py` + `jaffle_shop.py` (drop/seed jaffle_shop, then dbt-build it — asset-scheduled off `SEED://JAFFLE_SHOP`), and `philvolcs.py` (PHIVOLCS pipeline, manual-only — see below). The jaffle_shop pair is the working reference for this stack; verified end-to-end 2026-11-10.
 - `dbt/jaffle_shop/` — dbt project: models, seeds, macros. `dbt_project.yml` expects a profile named `jaffle_shop`.
+- `dbt/philvolcs/` — dual-target dbt project: `postgres` for staging (`stg_earthquakes` → `flash_report_input`), `bigquery` for `flash_reports` (never run a full `dbt run` on one target).
 - `tests/dags/` — pytest DAG tests (the only tests; no dbt tests directory exists yet).
-- `plugins/`, `include/` — empty.
+- `plugins/` — empty. `include/` — `gsrsaovsslca2018.pem` (PHIVOLCS SSL, see gotchas).
+
+## PHIVOLCS pipeline (`dags/philvolcs.py`)
+
+Scrape PHIVOLCS latest-earthquake table → Postgres → dbt staging → Gemini structured-output flash report → BigQuery (`n8n-rogverse.philvolcs.raw_llm_flash_reports`, then dbt materializes `flash_reports`). Manual trigger only; needs connections `postgres` + `bigquery-n8n` and Variable `GEMINIKEYS` (comma-separated) from gitignored `airflow_settings.yaml`. Verified end-to-end 2026-11-10 (run `manual__2026-11-10T22:15:08` all green). 22 tests in `tests/dags/test_philvolcs.py`.
 
 ## Gotchas
 
@@ -35,3 +40,8 @@ Every DAG must import cleanly, have non-empty `tags=[...]`, and set `default_arg
 - **No checked-in dbt profile** (no `profiles.yml`) — Cosmos generates one at runtime from `ProfileConfig`. Execution needs the Airflow connection `postgres` (local Compose DB, `postgres:postgres`, schema `public`), defined in the **gitignored** `airflow_settings.yaml`; after editing it, `astro dev start` re-imports it (restart alone may not).
 - **`.env` and `airflow_settings.yaml` are gitignored** — local-only state that never reaches the repo (`airflow_settings.yaml` currently holds the local `postgres` connection; `.env` is empty).
 - `.astro/test_dag_integrity_default.py` is generated/used by `astro dev parse`; never edit it.
+- **PHIVOLCS serves only its leaf cert** (no GlobalSign intermediate) → stock Python fails SSL. `dags/philvolcs.py::_ca_bundle()` concatenates certifi + `include/gsrsaovsslca2018.pem` and passes it as `verify=`. shortcut: delete once the server sends a full chain.
+- **This BigQuery project is free tier**: streaming insert (`insert_rows_json`) → 403 "Streaming insert is not allowed in the free tier". Use `client.load_table_from_json(...)` + `.result()` instead (load jobs are allowed). Also BigQuery rejects FLOAT64 in window `PARTITION BY` ("Partitioning by expressions of type FLOAT64 is not allowed") — `flash_reports.sql` partitions by `event_time` only, never lat/lon.
+- **Gemini rotation in `philvolcs.py` (`_attempt_report`)** is ported from rpfilomeno/phsim-astro `generate-site-data.ts`: capacity errors (502/503/404/429, "high demand|overload") skip the model without burning one of `MAX_LLM_ATTEMPTS=3`, the first timeout per call is refunded, micro-backoff 0.5/1/2s, `GEMINI_FALLBACK_MODELS` when `models.list` fails. Keys are logged by index only and `_scrub()` strips `?key=` from error text — never log key material (the reference logs key suffixes; that is forbidden here).
+- **Postgres `to_timestamp` + `HH12` quirk**: a literal like `" - "` immediately before `HH12` eats one hour char, silently mis-parsing 10:xx times ("hour 0 is invalid for the 12-hour clock"). `stg_earthquakes.sql` splits on `' - '` first, then parses the time part; all 615 rows verified.
+- **Ad-hoc BigQuery checks from a bare `docker exec python3`**: `BaseHook.get_connection`/`Connection.get` raises "conn_id isn't defined" outside task context (Airflow 3 SDK), and the `connection.extra` column is Fernet-encrypted. Query the metadata DB with `airflow.models.connection.Connection` via `AIRFLOW__DATABASE__SQL_ALCHEMY_CONN` — it decrypts on access.
