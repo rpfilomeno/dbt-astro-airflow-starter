@@ -7,6 +7,10 @@ services:
     volumes:
       - ./dbt:/usr/local/airflow/dbt:rw
 
+  dag-processor:
+    volumes:
+      - ./dbt:/usr/local/airflow/dbt:rw
+
   triggerer:
     volumes:
       - ./dbt:/usr/local/airflow/dbt:rw

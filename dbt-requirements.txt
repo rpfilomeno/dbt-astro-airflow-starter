@@ -1,2 +1,3 @@
 dbt-core
 dbt-postgres
+dbt-bigquery
