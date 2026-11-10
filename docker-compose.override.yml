@@ -1,0 +1,12 @@
+services:
+  scheduler:
+    volumes:
+      - ./dbt:/usr/local/airflow/dbt:rw
+
+  api-server:
+    volumes:
+      - ./dbt:/usr/local/airflow/dbt:rw
+
+  triggerer:
+    volumes:
+      - ./dbt:/usr/local/airflow/dbt:rw

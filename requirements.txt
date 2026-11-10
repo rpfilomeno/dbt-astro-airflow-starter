@@ -1,2 +1,3 @@
 # Astro Runtime includes the following pre-installed providers packages: https://www.astronomer.io/docs/astro/runtime-image-architecture#provider-packages
-astronomer-cosmos[dbt.all]
+# No [dbt.all] extra: on Runtime 3.3 it backtracks to cosmos 1.10.3, which crash-loops Airflow (circular import, fixed in >=1.14); >=1.14 with dbt.all is unsatisfiable (dbt-mysql vs dbt-starrocks forces jinja2==3.1.2, Airflow needs >=3.1.5). dbt runs from the dbt_venv built by the Dockerfile.
+astronomer-cosmos==1.16.0
