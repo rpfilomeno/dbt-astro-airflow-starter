@@ -3,11 +3,16 @@ selection, and structured-output validation. The DAG module is loaded directly
 from the dags folder (it is not importable by module name from tests/)."""
 
 import importlib.util
-import json
 import os
 
 import pytest
-import requests as real_requests
+from pydantic_ai.exceptions import (
+    ModelHTTPError,
+    ModelNotFoundError,
+    ModelRateLimitError,
+    ModelTimeoutError,
+    ModelUnavailableError,
+)
 
 SAMPLE_HTML = """
 <html><body>
@@ -113,30 +118,30 @@ def _good_payload():
     }
 
 
-def test_validate_flash_report_accepts_good_payload():
-    payload = mod.validate_flash_report(_good_payload())
-    assert payload["urgency"] == "moderate"
+def test_flash_report_accepts_good_payload():
+    report = mod.FlashReport(**_good_payload())
+    assert report.urgency == "moderate"
 
 
-def test_validate_flash_report_rejects_missing_field():
+def test_flash_report_rejects_missing_field():
     payload = _good_payload()
     del payload["flash_report_message"]
-    with pytest.raises(ValueError, match="missing fields"):
-        mod.validate_flash_report(payload)
+    with pytest.raises(ValueError, match="flash_report_message"):
+        mod.FlashReport(**payload)
 
 
-def test_validate_flash_report_rejects_bad_urgency():
+def test_flash_report_rejects_bad_urgency():
     payload = _good_payload()
     payload["urgency"] = "catastrophic"
     with pytest.raises(ValueError, match="urgency"):
-        mod.validate_flash_report(payload)
+        mod.FlashReport(**payload)
 
 
-def test_validate_flash_report_rejects_wrong_type():
+def test_flash_report_rejects_wrong_type():
     payload = _good_payload()
-    payload["magnitude"] = "4.5"
+    payload["magnitude"] = "not a number"
     with pytest.raises(ValueError, match="magnitude"):
-        mod.validate_flash_report(payload)
+        mod.FlashReport(**payload)
 
 
 class _FakeResult:
@@ -182,36 +187,14 @@ def test_already_reported_handles_iso_string_event_time():
     assert mod._already_reported(_FakeClient([]), event) is False
 
 
-class _FakeResp:
-    def __init__(self, status, payload=None, text=""):
-        self.status_code = status
-        self.ok = 200 <= status < 300
-        self._payload = payload
-        self.text = text
-
-    def json(self):
-        if self._payload is None:
-            raise ValueError("no json body")
-        return self._payload
-
-
-def _llm_ok(payload=None):
-    payload = payload or _good_payload()
-    return _FakeResp(
-        200, {"candidates": [{"content": {"parts": [{"text": json.dumps(payload)}]}}]}
-    )
-
-
-class _FakeRequests:
-    """requests stand-in: replays scripted outcomes, in order."""
-
-    exceptions = real_requests.exceptions
+class _FakeCall:
+    """_call_model stand-in: replays scripted outcomes, in order."""
 
     def __init__(self, outcomes):
         self._outcomes = list(outcomes)
         self.calls = 0
 
-    def post(self, url, **kwargs):
+    def __call__(self, key, model, prompt):
         out = self._outcomes[self.calls]
         self.calls += 1
         if isinstance(out, Exception):
@@ -219,20 +202,39 @@ class _FakeRequests:
         return out
 
 
-_HANG = real_requests.exceptions.ReadTimeout("read timed out")
+def _llm_ok():
+    return mod.FlashReport(**_good_payload())
+
+
+def _cap():
+    return ModelUnavailableError("models/x", "The model is overloaded")
+
+
+def _hang():
+    return ModelTimeoutError("models/x", "model timed out")
+
+
+@pytest.mark.parametrize(
+    "exc,expected",
+    [
+        (ModelNotFoundError("models/x", "not found"), "dead"),
+        (ModelRateLimitError("models/x", "rate limited"), "strike"),
+        (ModelUnavailableError("models/x", "overloaded"), "capacity"),
+        (ModelTimeoutError("models/x", "model timed out"), "timeout"),
+        (ModelHTTPError(502, "models/x", None), "capacity"),
+        (ModelHTTPError(503, "models/x", None), "capacity"),
+        (ModelHTTPError(500, "models/x", None), "burn"),
+        (ValueError("output failed validation"), "burn"),
+    ],
+)
+def test_classify_maps_failures_to_rotation_buckets(exc, expected):
+    assert mod._classify(exc) == expected
 
 
 def test_attempt_report_capacity_errors_do_not_burn_tries(monkeypatch):
     # 3 burned tries would exhaust MAX_LLM_ATTEMPTS before reaching the good model
-    fake = _FakeRequests(
-        [
-            _FakeResp(503, text="The model is overloaded"),
-            _FakeResp(503, text="The model is overloaded"),
-            _FakeResp(503, text="The model is overloaded"),
-            _llm_ok(),
-        ]
-    )
-    monkeypatch.setattr(mod, "requests", fake)
+    fake = _FakeCall([_cap(), _cap(), _cap(), _llm_ok()])
+    monkeypatch.setattr(mod, "_call_model", fake)
     payload = mod._attempt_report("p", ["k1", "k2"], ["models/a", "models/b", "models/c", "models/d"])
     assert payload["_model"] == "models/d"
     assert fake.calls == 4
@@ -240,25 +242,24 @@ def test_attempt_report_capacity_errors_do_not_burn_tries(monkeypatch):
 
 def test_attempt_report_refunds_first_hang(monkeypatch):
     # without the refund, 3 hangs burn all tries before the healthy model
-    fake = _FakeRequests([_HANG, _HANG, _HANG, _llm_ok()])
-    monkeypatch.setattr(mod, "requests", fake)
+    fake = _FakeCall([_hang(), _hang(), _hang(), _llm_ok()])
+    monkeypatch.setattr(mod, "_call_model", fake)
     payload = mod._attempt_report("p", ["k1"], ["models/a", "models/b", "models/c", "models/d"])
     assert payload["_model"] == "models/d"
     assert fake.calls == 4
 
 
 def test_attempt_report_raises_when_every_model_hangs(monkeypatch):
-    fake = _FakeRequests([_HANG, _HANG])
-    monkeypatch.setattr(mod, "requests", fake)
+    fake = _FakeCall([_hang(), _hang()])
+    monkeypatch.setattr(mod, "_call_model", fake)
     with pytest.raises(RuntimeError, match="timed out"):
         mod._attempt_report("p", ["k1"], ["models/a", "models/b"])
 
 
-def test_attempt_report_invalid_payload_burns_try_and_rotates(monkeypatch):
+def test_attempt_report_invalid_output_burns_try_and_rotates(monkeypatch):
     monkeypatch.setattr(mod.time, "sleep", lambda s: None)  # skip micro-backoff
-    bad = _FakeResp(200, {"candidates": [{"content": {"parts": [{"text": "not json"}]}}]})
-    fake = _FakeRequests([bad, _llm_ok()])
-    monkeypatch.setattr(mod, "requests", fake)
+    fake = _FakeCall([ValueError("output failed validation"), _llm_ok()])
+    monkeypatch.setattr(mod, "_call_model", fake)
     payload = mod._attempt_report("p", ["k1"], ["models/a", "models/b"])
     assert payload["_model"] == "models/b"
     assert fake.calls == 2

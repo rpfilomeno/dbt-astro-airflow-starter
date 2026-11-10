@@ -7,10 +7,10 @@ plus the dbt project dbt/philvolcs (targets: postgres for staging, bigquery for
 the final flash_reports table in n8n-rogverse.philvolcs).
 """
 
-import json
 import logging
 import re
 import time
+from typing import Literal
 
 import requests
 from airflow.decorators import task
@@ -22,6 +22,7 @@ from cosmos.profiles.bigquery.service_account_keyfile_dict import (
     GoogleCloudServiceAccountDictProfileMapping,
 )
 from pendulum import datetime, now
+from pydantic import BaseModel
 
 PHIVOLCS_URL = "https://earthquake.phivolcs.dost.gov.ph/"
 USER_AGENT = "dbt-astro-airflow-starter/1.0 (local research pipeline)"
@@ -40,46 +41,25 @@ log = logging.getLogger(__name__)
 
 DATE_RE = re.compile(r"^\d{1,2} [A-Za-z]+ \d{4} - \d{1,2}:\d{2} [AP]M$")
 NUM_RE = re.compile(r"^-?\d+(\.\d+)?$")
-URGENCIES = ("low", "moderate", "high")
 
-# Structured output for Gemini (uppercase types = the Gemini REST dialect).
-FLASH_REPORT_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "headline": {"type": "STRING"},
-        "flash_report_message": {"type": "STRING"},
-        "magnitude": {"type": "NUMBER"},
-        "latitude": {"type": "NUMBER"},
-        "longitude": {"type": "NUMBER"},
-        "depth_km": {"type": "INTEGER"},
-        "location": {"type": "STRING"},
-        "event_time": {"type": "STRING"},
-        "urgency": {"type": "STRING", "enum": ["low", "moderate", "high"]},
-    },
-    "required": [
-        "headline",
-        "flash_report_message",
-        "magnitude",
-        "latitude",
-        "longitude",
-        "depth_km",
-        "location",
-        "event_time",
-        "urgency",
-    ],
-}
 
-FLASH_REPORT_FIELDS = {
-    "headline": str,
-    "flash_report_message": str,
-    "magnitude": (int, float),
-    "latitude": (int, float),
-    "longitude": (int, float),
-    "depth_km": (int, float),
-    "location": str,
-    "event_time": str,
-    "urgency": str,
-}
+class FlashReport(BaseModel):
+    """Structured output of the Gemini call (pydantic-ai validates the reply).
+
+    Replaces the hand-rolled FLASH_REPORT_SCHEMA responseSchema dict and
+    validate_flash_report(): pydantic-ai sends this schema to the API and
+    raises on anything that does not parse into it.
+    """
+
+    headline: str
+    flash_report_message: str
+    magnitude: float
+    latitude: float
+    longitude: float
+    depth_km: int
+    location: str
+    event_time: str
+    urgency: Literal["low", "moderate", "high"]
 
 CREATE_RAW_TABLE_SQL = """
 create table if not exists raw_phivolcs_earthquakes (
@@ -159,24 +139,6 @@ def pick_flash_models(model_names):
     )
 
 
-def validate_flash_report(payload):
-    """Structural validation of the model's structured output; raises ValueError."""
-    if not isinstance(payload, dict):
-        raise ValueError(f"flash report payload is not an object: {payload!r}")
-    missing = [k for k in FLASH_REPORT_FIELDS if k not in payload]
-    if missing:
-        raise ValueError(f"flash report missing fields: {missing}")
-    for key, expected in FLASH_REPORT_FIELDS.items():
-        value = payload[key]
-        if not isinstance(value, expected) or isinstance(value, bool):
-            raise ValueError(f"flash report field {key!r} has wrong type: {value!r}")
-        if isinstance(value, str) and not value.strip():
-            raise ValueError(f"flash report field {key!r} is empty")
-    if payload["urgency"] not in URGENCIES:
-        raise ValueError(f"urgency must be one of {URGENCIES}: {payload['urgency']!r}")
-    return payload
-
-
 def _build_prompt(event):
     return (
         "You are the PHIVOLCS flash report desk. Write a concise, official-style "
@@ -228,6 +190,52 @@ def _scrub(text):
     """Strip the API key from anything that may reach the logs (requests embeds
     the query string in connection errors)."""
     return re.sub(r"[?&]key=[^&\s]+", "?key=<redacted>", str(text))
+
+
+def _call_model(key, model, prompt):
+    """One structured-output Gemini call through pydantic-ai; raises on failure.
+
+    No inner HTTP retries: google-genai's retry options default to off, so
+    the rotation policy in _attempt_report stays the only retry logic.
+    """
+    from pydantic_ai import Agent
+    from pydantic_ai.models.google import GoogleModel
+    from pydantic_ai.providers.google import GoogleProvider
+
+    agent = Agent(
+        GoogleModel(model, provider=GoogleProvider(api_key=key)),
+        output_type=FlashReport,
+        model_settings={"timeout": 60},
+    )
+    return agent.run_sync(prompt).output
+
+
+def _classify(exc):
+    """Rotation bucket for a _call_model failure: one of
+    "timeout" | "dead" | "strike" | "capacity" | "burn".
+
+    dead/strike/capacity/timeout switch models without burning an attempt;
+    "burn" consumes one of MAX_LLM_ATTEMPTS. Matches pydantic-ai's exception
+    taxonomy (ModelNotFoundError=404, ModelRateLimitError=429,
+    ModelUnavailableError=503, ModelTimeoutError) with status-code and
+    message fallbacks for anything the SDK wraps differently.
+    """
+    name = type(exc).__name__
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if "Timeout" in name or isinstance(exc, TimeoutError):
+        return "timeout"
+    if "NotFound" in name or status == 404:
+        return "dead"
+    if "RateLimit" in name or status == 429:
+        return "strike"
+    if (
+        "Unavailable" in name
+        or "Overloaded" in name
+        or status in (502, 503)
+        or re.search(r"high demand|overload", _scrub(exc), re.I)
+    ):
+        return "capacity"
+    return "burn"
 
 
 def _attempt_report(prompt, keys, models):
@@ -285,38 +293,21 @@ def _attempt_report(prompt, keys, models):
         tries += 1
         who = f"try {tries}/{MAX_LLM_ATTEMPTS} {model} key {keys.index(key) + 1}/{len(keys)}"
         try:
-            resp = requests.post(
-                f"{GEMINI_BASE}/{model}:generateContent",
-                params={"key": key},
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {
-                        "responseMimeType": "application/json",
-                        "responseSchema": FLASH_REPORT_SCHEMA,
-                    },
-                },
-                timeout=60,
-            )
-        except requests.exceptions.Timeout:
-            dead_models[model] = "timeout"
-            if not refund_hung:
-                refund_hung = True
-                tries -= 1
-            last_error = f"{model}: timed out"
-            log.warning("[llm] %s -> timeout; model marked unresponsive", who)
-            continue
-        except requests.exceptions.RequestException as exc:
+            result = _call_model(key, model, prompt)
+        except Exception as exc:
+            bucket = _classify(exc)
             last_error = f"{model}: {_scrub(exc)}"
-            wait_next = True
-            log.warning("[llm] %s -> %s; retrying", who, last_error)
-            continue
-        if not resp.ok:
-            detail = "rate-limited" if resp.status_code == 429 else _scrub(resp.text[:200])
-            last_error = f"{model} -> HTTP {resp.status_code}: {detail}"
-            if resp.status_code == 404:
+            if bucket == "timeout":
+                dead_models[model] = "timeout"
+                if not refund_hung:
+                    refund_hung = True
+                    tries -= 1
+                log.warning("[llm] %s -> timeout; model marked unresponsive", who)
+            elif bucket == "dead":
                 dead_models[model] = "HTTP 404"
                 tries -= 1
-            elif resp.status_code == 429:
+                log.warning("[llm] %s -> %s; model retired", who, last_error)
+            elif bucket == "strike":
                 # Attribute before banning: strike the key, count distinct keys
                 # on the model; kill each only once the evidence is there.
                 tries -= 1
@@ -328,26 +319,17 @@ def _attempt_report(prompt, keys, models):
                     dead_keys.add(key)
                 if len(seen) >= 2 or len(keys) == 1:
                     dead_models[model] = "HTTP 429"
-            elif resp.status_code in (502, 503) or re.search(
-                r"high demand|overload", detail, re.I
-            ):
+                log.warning("[llm] %s -> rate-limited; strikes recorded", who)
+            elif bucket == "capacity":
                 tries -= 1  # capacity spike: switch now, keep the try
                 skip.add(model)
-            else:
+                log.warning("[llm] %s -> %s; switching model", who, last_error)
+            else:  # burn: real failure, incl. output that failed validation
                 wait_next = True
-            log.warning("[llm] %s -> %s", who, last_error)
-            continue
-        try:
-            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-            if not text:
-                raise ValueError("model returned no content")
-            payload = validate_flash_report(json.loads(text))
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
-            last_error = f"{model}: {exc}"
-            wait_next = True
-            log.warning("[llm] %s -> invalid payload: %s", who, exc)
+                log.warning("[llm] %s -> %s; retrying", who, last_error)
             continue
         log.info("[llm] ok (%s)", who)
+        payload = result.model_dump()
         payload["_model"] = model
         return payload
     if not last_error:
