@@ -1,0 +1,52 @@
+# Sample for airflow_settings.yaml - copy this file to `airflow_settings.yaml`
+# and fill in real values. The copy is gitignored (it holds credentials); this
+# sample is not, so keep placeholders only.
+#
+# `astro dev start` imports airflow_settings.yaml on every start (a plain
+# restart may not re-import it). Airflow Variables/Connections are only local.
+
+airflow:
+  connections:
+    # Local Airflow metadata-adjacent Postgres (the Compose service name).
+    - conn_id: postgres
+      conn_type: postgres
+      conn_host: postgres
+      conn_schema: postgres
+      conn_login: postgres
+      conn_password: postgres
+      conn_port: 5432
+
+    # BigQuery connection for the philvolcs pipeline (dags/philvolcs.py reads
+    # `keyfile_dict` + `project` from conn_extra). Paste the full
+    # service-account JSON keys as yaml key/value pairs.
+    - conn_id: bigquery-n8n
+      conn_type: google_cloud_platform
+      conn_extra:
+        project: your-gcp-project
+        dataset: philvolcs
+        keyfile_dict:
+          type: service_account
+          project_id: your-gcp-project
+          private_key_id: your-private-key-id
+          private_key: |
+            -----BEGIN PRIVATE KEY-----
+            paste-your-service-account-private-key-here
+            -----END PRIVATE KEY-----
+          client_email: your-sa@your-gcp-project.iam.gserviceaccount.com
+          client_id: your-client-id
+          auth_uri: https://accounts.google.com/o/oauth2/auth
+          token_uri: https://oauth2.googleapis.com/token
+          auth_provider_x509_cert_url: https://www.googleapis.com/oauth2/v1/certs
+          client_x509_cert_url: https://www.googleapis.com/robot/v1/metadata/x509/your-sa%40your-gcp-project.iam.gserviceaccount.com
+          universe_domain: googleapis.com
+
+  pools:
+    - pool_name:
+      pool_slot:
+      pool_description:
+
+  variables:
+    # Comma-separated Gemini API keys for dags/philvolcs.py (the rotation
+    # policy strikes keys/models on 429s, so more than one key is useful).
+    - variable_name: GEMINIKEYS
+      variable_value: your-first-key,your-second-key

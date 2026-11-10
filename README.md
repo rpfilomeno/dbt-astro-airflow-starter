@@ -16,7 +16,7 @@ astro dev parse            # DAG parse validation
 astro dev stop | kill      # stop / tear down
 ```
 
-`astro dev start` imports `airflow_settings.yaml` (gitignored): the `postgres` connection, the `bigquery-n8n` connection (service-account `keyfile_dict`), and the `GEMINIKEYS` variable (comma-separated Gemini API keys). Edit that file and restart to change them.
+`astro dev start` imports `airflow_settings.yaml` (gitignored): the `postgres` connection, the `bigquery-n8n` connection (service-account `keyfile_dict`), and the `GEMINIKEYS` variable (comma-separated Gemini API keys). Copy `airflow_settings.sample.yml` to `airflow_settings.yaml` and fill in real values; edit that file and restart to change them.
 
 New DAGs are created **paused** — unpause once: `astro dev run dags unpause <dag_id>`.
 
